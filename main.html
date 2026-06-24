@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rally Navigator</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; background: #111; }
+    #map { width: 100vw; height: 100vh; }
+    .controls {
+      position: absolute; top: 20px; left: 20px; z-index: 2000;
+      background: rgba(0,0,0,0.8); padding: 15px; border-radius: 12px;
+      display: flex; gap: 10px; flex-direction: column;
+      max-width: calc(100vw - 60px);
+    }
+    input { padding: 10px; width: 260px; max-width: 100%; box-sizing: border-box; border: none; border-radius: 8px; outline: none; }
+    button { padding: 10px; border: none; border-radius: 8px; background: cyan; color: black; font-weight: bold; cursor: pointer; }
+    button:disabled { background: #444; color: #888; cursor: not-allowed; }
+
+    .car-marker {
+      width: 22px; height: 22px;
+      background: #007aff;
+      border-radius: 50%;
+      border: 3px solid white;
+      box-shadow: 0 0 0 4px rgba(0,122,255,0.3);
+    }
+    .lookahead-dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.8); }
+
+    #status {
+      font-size: 12px; color: #aaa; text-align: center;
+    }
+
+    #hud {
+      position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+      z-index: 2000;
+      display: none;
+      flex-direction: row;
+      gap: 12px;
+      align-items: stretch;
+    }
+    .hud-card {
+      background: rgba(0,0,0,0.85);
+      font-family: monospace;
+      font-weight: bold;
+      padding: 14px 24px;
+      border-radius: 12px;
+      text-align: center;
+      white-space: nowrap;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .hud-card .label { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: #666; }
+    .hud-card .call  { font-size: 22px; letter-spacing: 1px; }
+    .hud-card .modifier { font-size: 12px; color: #aaa; letter-spacing: 0.5px; }
+    #card-now  { border: 1px solid cyan;    color: cyan;    }
+    #card-into { border: 1px solid #ffaa00; color: #ffaa00; }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <input id="end" placeholder="Destination (e.g. Porsche Centre Jakarta)">
+    <button id="go-btn" onclick="startNavigation()">Use My Location → Navigate</button>
+    <div id="status">Waiting for GPS...</div>
+  </div>
+  <div id="map"></div>
+
+  <div id="hud">
+    <div class="hud-card" id="card-now">
+      <div class="label">Now</div>
+      <div class="call" id="call-now">--</div>
+      <div class="modifier" id="mod-now"></div>
+    </div>
+    <div class="hud-card" id="card-into">
+      <div class="label">Into</div>
+      <div class="call" id="call-into">--</div>
+      <div class="modifier" id="mod-into"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map').setView([-6.2, 106.8], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    let currentRoute    = null;
+    let carMarker       = null;
+    let lookaheadMarkers = [];
+    let routeLatlngs    = null;
+    let watchId         = null;
+    let lastCarIdx      = 0;
+
+    const GROUP_A = [50, 55, 60];
+    const GROUP_B = [70, 75, 80];
+    const ALL_DISTANCES = [...GROUP_A, ...GROUP_B];
+
+    const statusEl  = document.getElementById('status');
+    const hud       = document.getElementById('hud');
+    const callNow   = document.getElementById('call-now');
+    const modNow    = document.getElementById('mod-now');
+    const callInto  = document.getElementById('call-into');
+    const modInto   = document.getElementById('mod-into');
+    const goBtn     = document.getElementById('go-btn');
+
+    // ----- Geocoding: Nominatim first, Photon fallback -----
+    async function geocode(address) {
+      // Try Nominatim with broader params
+      try {
+        const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=5&addressdetails=1`;
+        const data = await (await fetch(url, { headers: { 'Accept-Language': 'en' } })).json();
+        if (data.length > 0) {
+          setStatus(`Found: ${data[0].display_name.slice(0, 60)}...`);
+          return [parseFloat(data[0].lat), parseFloat(data[0].lon)];
+        }
+      } catch(e) {}
+
+      // Fallback: Photon (OpenStreetMap-based, better POI matching)
+      try {
+        const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(address)}&limit=1&lang=en`;
+        const data = await (await fetch(url)).json();
+        if (data.features && data.features.length > 0) {
+          const [lon, lat] = data.features[0].geometry.coordinates;
+          setStatus(`Found (Photon): ${data.features[0].properties.name || address}`);
+          return [lat, lon];
+        }
+      } catch(e) {}
+
+      alert(`Could not find: "${address}"\nTry adding the city, e.g. "Porsche Centre Jakarta Selatan"`);
+      return null;
+    }
+
+    // ----- Geo helpers -----
+    function haversine(a, b) {
+      const R = 6371000;
+      const dLat = (b[0] - a[0]) * Math.PI / 180;
+      const dLon = (b[1] - a[1]) * Math.PI / 180;
+      const lat1 = a[0] * Math.PI / 180;
+      const lat2 = b[0] * Math.PI / 180;
+      const x = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
+      return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1-x));
+    }
+
+    function pointAhead(latlngs, startIdx, targetMetres) {
+      let remaining = targetMetres;
+      for (let i = startIdx; i < latlngs.length - 1; i++) {
+        const seg = haversine(latlngs[i], latlngs[i+1]);
+        if (remaining <= seg) {
+          const t = remaining / seg;
+          return [
+            latlngs[i][0] + t * (latlngs[i+1][0] - latlngs[i][0]),
+            latlngs[i][1] + t * (latlngs[i+1][1] - latlngs[i][1])
+          ];
+        }
+        remaining -= seg;
+      }
+      return latlngs[latlngs.length - 1];
+    }
+
+    // Find the closest point on the route to a GPS position
+    function snapToRoute(latlngs, pos, fromIdx) {
+      let best = fromIdx, bestDist = Infinity;
+      // Only scan forward from last known position (don't go backward)
+      const scanFrom = Math.max(0, fromIdx - 5);
+      for (let i = scanFrom; i < latlngs.length; i++) {
+        const d = haversine(latlngs[i], pos);
+        if (d < bestDist) { bestDist = d; best = i; }
+        // Stop scanning if we've gone far past (>200m ahead of best)
+        if (i > best + 50) break;
+      }
+      return best;
+    }
+
+    function angleAt(latlngs, idx) {
+      const behind = Math.max(0, idx - 1);
+      const ahead  = Math.min(latlngs.length - 1, idx + 1);
+      if (behind === idx || ahead === idx) return 0;
+
+      const ax = latlngs[idx][1]   - latlngs[behind][1];
+      const ay = latlngs[idx][0]   - latlngs[behind][0];
+      const bx = latlngs[ahead][1] - latlngs[idx][1];
+      const by = latlngs[ahead][0] - latlngs[idx][0];
+
+      const magA = Math.sqrt(ax*ax + ay*ay);
+      const magB = Math.sqrt(bx*bx + by*by);
+      if (magA === 0 || magB === 0) return 0;
+
+      const dot   = Math.max(-1, Math.min(1, (ax*bx + ay*by) / (magA * magB)));
+      const deg   = Math.acos(dot) * 180 / Math.PI;
+      const cross = ax*by - ay*bx;
+      return cross < 0 ? deg : -deg;
+    }
+
+    function angleAtPoint(latlngs, pos) {
+      let best = 0, bestDist = Infinity;
+      for (let i = 0; i < latlngs.length; i++) {
+        const d = haversine(latlngs[i], pos);
+        if (d < bestDist) { bestDist = d; best = i; }
+      }
+      return angleAt(latlngs, best);
+    }
+
+    function rallyGrade(absDeg) {
+      if (absDeg < 10)  return 'Straight';
+      if (absDeg < 25)  return 'Easy';
+      if (absDeg < 45)  return '6';
+      if (absDeg < 65)  return '5';
+      if (absDeg < 85)  return '4';
+      if (absDeg < 110) return '3';
+      if (absDeg < 140) return '2';
+      if (absDeg < 170) return '1';
+      return 'Hairpin';
+    }
+
+    function dotColorForGroup(groupIdx, absDeg) {
+      const ratio = Math.min(absDeg / 170, 1);
+      if (groupIdx === 0) {
+        return `rgb(0,${Math.round(255 - ratio*100)},${Math.round(255 - ratio*150)})`;
+      } else {
+        return `rgb(255,${Math.round(200 - ratio*200)},0)`;
+      }
+    }
+
+    function groupCall(latlngs, carIdx, distances) {
+      const angles = distances.map(d => {
+        const pos = pointAhead(latlngs, carIdx, d);
+        return angleAtPoint(latlngs, pos);
+      });
+      const avg   = angles.reduce((s, a) => s + a, 0) / angles.length;
+      const abs   = Math.abs(avg);
+      const dir   = avg > 5 ? 'Right' : avg < -5 ? 'Left' : null;
+      const grade = rallyGrade(abs);
+      const diff  = Math.abs(angles[angles.length-1]) - Math.abs(angles[0]);
+
+      let modifier = '';
+      if (grade !== 'Straight' && grade !== 'Easy') {
+        if (diff > 5)       modifier = 'Tightens';
+        else if (diff < -5) modifier = 'Widens';
+      }
+
+      const call = (dir && grade !== 'Straight') ? `${grade} ${dir}` : grade;
+      return { call, modifier };
+    }
+
+    function createLookaheadIcon(color) {
+      return L.divIcon({
+        className: '',
+        html: `<div class="lookahead-dot" style="background:${color};"></div>`,
+        iconSize: [10, 10], iconAnchor: [5, 5]
+      });
+    }
+
+    function updateMarkers(latlngs, carIdx) {
+      ALL_DISTANCES.forEach((dist, i) => {
+        const groupIdx = i < GROUP_A.length ? 0 : 1;
+        const pos      = pointAhead(latlngs, carIdx, dist);
+        const angle    = angleAtPoint(latlngs, pos);
+        const color    = dotColorForGroup(groupIdx, Math.abs(angle));
+
+        if (lookaheadMarkers[i]) {
+          lookaheadMarkers[i].setLatLng(pos);
+          lookaheadMarkers[i].setIcon(createLookaheadIcon(color));
+        } else {
+          lookaheadMarkers[i] = L.marker(pos, {
+            icon: createLookaheadIcon(color),
+            zIndexOffset: 900 - i * 10
+          }).addTo(map);
+        }
+      });
+    }
+
+    function removeLookaheadMarkers() {
+      lookaheadMarkers.forEach(m => map.removeLayer(m));
+      lookaheadMarkers = [];
+    }
+
+    const carIcon = L.divIcon({
+      className: '',
+      html: '<div class="car-marker"></div>',
+      iconSize: [22, 22], iconAnchor: [11, 11]
+    });
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    // Called every time GPS updates
+    function onPosition(pos) {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      const latlng = [lat, lon];
+
+      setStatus(`GPS: ${lat.toFixed(5)}, ${lon.toFixed(5)}  ±${Math.round(pos.coords.accuracy)}m`);
+
+      // Update or create car marker
+      if (!carMarker) {
+        carMarker = L.marker(latlng, { icon: carIcon, zIndexOffset: 1000 }).addTo(map);
+      } else {
+        carMarker.setLatLng(latlng);
+      }
+
+      // If no route yet, just show position
+      if (!routeLatlngs) {
+        map.setView(latlng, 15);
+        return;
+      }
+
+      // Snap GPS position to nearest route point
+      lastCarIdx = snapToRoute(routeLatlngs, latlng, lastCarIdx);
+      map.panTo(latlng);
+
+      updateMarkers(routeLatlngs, lastCarIdx);
+
+      const gA = groupCall(routeLatlngs, lastCarIdx, GROUP_A);
+      const gB = groupCall(routeLatlngs, lastCarIdx, GROUP_B);
+
+      callNow.textContent  = gA.call;
+      modNow.textContent   = gA.modifier;
+      callInto.textContent = gB.call;
+      modInto.textContent  = gB.modifier;
+    }
+
+    function onGeoError(err) {
+      setStatus(`GPS error: ${err.message}`);
+    }
+
+    // Start watching GPS immediately
+    if ('geolocation' in navigator) {
+      watchId = navigator.geolocation.watchPosition(onPosition, onGeoError, {
+        enableHighAccuracy: true,
+        maximumAge: 1000,
+        timeout: 10000
+      });
+    } else {
+      setStatus('Geolocation not supported on this browser.');
+    }
+
+    async function startNavigation() {
+      const dest = document.getElementById('end').value.trim();
+      if (!dest) { alert('Enter a destination first.'); return; }
+
+      goBtn.disabled = true;
+      goBtn.textContent = 'Finding route...';
+      setStatus('Geocoding destination...');
+
+      const endCoords = await geocode(dest);
+      if (!endCoords) {
+        goBtn.disabled = false;
+        goBtn.textContent = 'Use My Location → Navigate';
+        return;
+      }
+
+      // Get current GPS position for route start
+      navigator.geolocation.getCurrentPosition(async (pos) => {
+        const startCoords = [pos.coords.latitude, pos.coords.longitude];
+
+        setStatus('Fetching route...');
+
+        const routeUrl =
+          `https://router.project-osrm.org/route/v1/driving/`
+          + `${startCoords[1]},${startCoords[0]};`
+          + `${endCoords[1]},${endCoords[0]}`
+          + `?overview=full&geometries=geojson`;
+
+        try {
+          const routeData = await (await fetch(routeUrl)).json();
+          routeLatlngs = routeData.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+
+          if (currentRoute) map.removeLayer(currentRoute);
+          removeLookaheadMarkers();
+          lastCarIdx = 0;
+
+          currentRoute = L.polyline(routeLatlngs, { color: 'yellow', weight: 6 }).addTo(map);
+          map.fitBounds(currentRoute.getBounds());
+
+          hud.style.display = 'flex';
+          setStatus('Navigating — GPS updates live');
+        } catch(e) {
+          setStatus('Route fetch failed. Check connection.');
+        }
+
+        goBtn.disabled = false;
+        goBtn.textContent = 'Use My Location → Navigate';
+
+      }, onGeoError, { enableHighAccuracy: true, timeout: 10000 });
+    }
+  </script>
+</body>
+</html>
